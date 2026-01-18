@@ -1,4 +1,5 @@
 import genesis as gs
+import genesis.utils.geom as gu
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -189,38 +190,38 @@ def create_scene():
         show_viewer=False,
     )
     plane = scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=1.2))
-    
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
-    
     target = scene.add_entity(
         gs.morphs.Box(size=(0.406, 0.254, 0.305), fixed=True),
         material=gs.materials.Rigid(friction=1.0)
     )
-    
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
     
-    # FIXED: Initialize with dummies, then attach
+    # Initialize with dummies, then attach
     robot_cam = scene.add_camera(
-        res=(96, 96), 
+        res=(96, 96),
         pos=(0.0, 0.0, 0.0), # Dummy, overridden by attach
         lookat=(1.0, 0.0, 0.0), # Dummy
-        fov=70, 
-        near=0.01, 
+        fov=70,
+        near=0.01,
         far=20.0
     )
-    
-    # Attach to base_link (since camera_link is fused)
-    # This automatically handles batched transforms for all envs.
-    robot_cam.attach(
-    picar,                 # entity (URDF)
-    "base_link",            # link name (string)
-    pos=(0.14, 0.0, 0.10),
-    quat=get_camera_relative_quat()
-)
 
-    
+    # --- FIX START ---
+    # Convert position and quaternion to a 4x4 transform matrix
+    rel_pos = np.array([0.14, 0.0, 0.10])
+    rel_quat = np.array(get_camera_relative_quat())
+    rel_transform = gu.trans_quat_to_T(rel_pos, rel_quat)
+
+    # Attach using (link, transform_matrix)
+    robot_cam.attach(
+        picar.get_link("base_link"),
+        rel_transform
+    )
+    # --- FIX END ---
+
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
 
@@ -253,152 +254,141 @@ class VisionPolicy(nn.Module):
 
 def train():
     scene, picar, target, viewer_cam, robot_cam = create_scene()
+    
     j_names = ["joint_rl", "joint_rr"]
     motor_indices = [picar.get_joint(name).dofs_idx_local[0] for name in j_names]
-
+    
     policy = VisionPolicy(act_dim=2).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
-
+    
     full_cmds = torch.zeros((2048, 20), device=device)
-
     max_steps = 500
     contact_threshold = 0.45
 
     for epoch in range(40):
         scene.reset()
-
+        
         robot_angles = torch.rand(2048, device=device) * 2 * np.pi
         euler_input = torch.stack([torch.zeros(2048, device=device), torch.zeros(2048, device=device), robot_angles], dim=1)
         robot_quat = euler_to_quat_tensor(euler_input)
         picar.set_quat(robot_quat)
-
+        
         target_angles = torch.rand(2048, device=device) * 2 * np.pi
         target_dists = 0.6 + torch.rand(2048, device=device) * 2.4
         target_x = target_dists * torch.cos(target_angles)
         target_y = target_dists * torch.sin(target_angles)
         target_pos = torch.stack([target_x, target_y, torch.full((2048,), 0.1525, device=device)], dim=1)
         target.set_pos(target_pos)
-
+        
         pos = picar.get_pos()
         previous_dist = torch.norm(pos[:, :2] - target_pos[:, :2], dim=1)
-
-        # No manual update needed for camera
-
+        
         done = torch.zeros(2048, dtype=torch.bool, device=device)
-
         log_probs_list = []
         entropies_list = []
         rewards_list = []
-
+        
         for step in range(max_steps):
             if done.all():
                 break
-
+            
             rgb, _, _, _ = robot_cam.render()
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
-            
             obs = rgb.to(device)
-
+            
             mean, std = policy(obs)
             distri = D.Normal(mean, std)
             action = distri.rsample()
-
             log_prob = distri.log_prob(action).sum(dim=-1)
             entropy = distri.entropy().sum(dim=-1)
-
+            
             log_probs_list.append(log_prob)
             entropies_list.append(entropy)
-
+            
             action_control = action.clone()
             action_control[done] = 0.0
-
+            
             full_cmds.fill_(0)
             full_cmds[:, motor_indices[0]] = action_control[:, 0]
             full_cmds[:, motor_indices[1]] = action_control[:, 1]
-
             picar.control_dofs_velocity(full_cmds)
+            
             scene.step()
-
-            # No manual update needed for camera
-
+            
             new_pos = picar.get_pos()
             new_dist = torch.norm(new_pos[:, :2] - target_pos[:, :2], dim=1)
-
             new_quat = picar.get_quat()
+            
             # [w, x, y, z]
-            yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]),
+            yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]), 
                               1 - 2 * (new_quat[:,2]**2 + new_quat[:,3]**2))
             
             desired_yaw = torch.atan2(target_pos[:,1] - new_pos[:,1], target_pos[:,0] - new_pos[:,0])
             diff = (desired_yaw - yaw + np.pi) % (2 * np.pi) - np.pi
             heading_bonus = torch.cos(diff)
-
+            
             reward = (previous_dist - new_dist) * 10.0
             reward += heading_bonus
             reward -= (action ** 2).mean(dim=1) * 0.0001
             reward -= 0.02
-
+            
             contact = new_dist < contact_threshold
             new_contact = contact & ~done
             reward[new_contact] += 200.0
-
             done = done | contact
-
             previous_dist = new_dist.clone()
-
+            
             rewards_list.append(reward)
-
+        
         log_probs = torch.stack(log_probs_list, dim=1)
         entropies = torch.stack(entropies_list, dim=1)
         rewards = torch.stack(rewards_list, dim=1)
+        
         returns = rewards.sum(dim=1)
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-
+        
         loss = -((log_probs.sum(dim=1) * returns.detach()).mean() + 0.01 * entropies.mean())
-
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
+        
         success_rate = done.float().mean().item()
         avg_dist = new_dist.mean().item()
         print(f"Epoch {epoch}: Success {success_rate:.3f} Final Dist {avg_dist:.2f}")
 
     torch.save(policy.state_dict(), "picar_vision_policy.pth")
-
+    
     scene.reset()
     target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * 2048, device=device))
-    
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
-
+    
     for i in range(max_steps):
         rgb, _, _, _ = robot_cam.render()
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
         obs = rgb[0:1].to(device)
-
         mean, _ = policy(obs)
         actions = mean
-
+        
         full_cmds.fill_(0)
         full_cmds[:, motor_indices[0]] = actions[:, 0]
         full_cmds[:, motor_indices[1]] = actions[:, 1]
-
         picar.control_dofs_velocity(full_cmds)
+        
         scene.step()
-
+        
         car_pos = picar.get_pos()[0].cpu().numpy()
         viewer_cam.set_pose(pos=(car_pos[0]-4, car_pos[1]-4, 3.0), lookat=(car_pos[0], car_pos[1], 0.0))
-
+        
         frame_rgb, _, _, _ = viewer_cam.render()
         if frame_rgb.ndim == 4:
             frame_rgb = frame_rgb[0]
-        
         frame = (frame_rgb.cpu().numpy() * 255).astype(np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         out.write(frame)
-
+    
     out.release()
     print("Demo video saved")
 
