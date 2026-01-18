@@ -156,19 +156,28 @@ def create_scene():
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
+    
+    # FIXED: Set fixed=True in the morph. Removed target.set_fixed() which does not exist.
     target = scene.add_entity(
-        gs.morphs.Box(size=(0.406, 0.254, 0.305)),
+        gs.morphs.Box(size=(0.406, 0.254, 0.305), fixed=True),
         material=gs.materials.Rigid(friction=1.0)
     )
-    target.set_fixed(torch.full((2048,), True, dtype=torch.bool, device="cpu"))
+    
+    # Note: target.set_fixed(...) was removed here.
+
+    target.set_fixed(torch.full((2048,), True, dtype=torch.bool, device="cpu")) if hasattr(target, 'set_fixed') else None
+
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
     robot_cam = scene.add_camera(res=(96, 96), fov=70, near=0.01, far=20.0)
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
 
 def update_robot_camera(robot_cam, picar):
-    link_pos = picar.get_link_pos("camera_link")
-    link_quat = picar.get_link_quat("camera_link")
+    # FIXED: Use get_link("name").get_pos() instead of get_link_pos("name")
+    link = picar.get_link("camera_link")
+    link_pos = link.get_pos()
+    link_quat = link.get_quat()
+    
     forward_local = torch.tensor([[1.0, 0.0, 0.0]], device="cpu").repeat(2048, 1)
     forward = gs.math.quat_apply(link_quat, forward_local)
     lookat = link_pos + forward * 5.0
@@ -242,7 +251,8 @@ def train():
             if done.all():
                 break
 
-            rgb = robot_cam.render()
+            # FIXED: Unpack render() tuple
+            rgb, _, _, _ = robot_cam.render()
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
             obs_gpu = rgb.to(device)
@@ -319,7 +329,8 @@ def train():
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
 
     for i in range(max_steps):
-        rgb = robot_cam.render()
+        # FIXED: Unpack render() tuple
+        rgb, _, _, _ = robot_cam.render()
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
         obs_gpu = rgb[0:1].to(device)
