@@ -87,30 +87,30 @@ def run_phase_2_recording():
     plane = scene.add_entity(gs.morphs.Plane())
     car = scene.add_entity(gs.morphs.URDF(file='picarx.urdf', fixed=False, pos=(0, 0, 0.1)))
 
-    cam = scene.add_camera(
-        res=(96, 96),
-        fov=60,
-        GUI=False
-    )
+    # Camera setup
+    cam = scene.add_camera(res=(96, 96), fov=60, GUI=False)
 
     scene.build(n_envs=1)
 
-    # Attach Camera (Same fix as Phase 1)
+    # Attach Camera
     T_cam = np.eye(4)
     T_cam[:3, 3] = np.array([0.1, 0.0, 0.15]) 
-    cam.attach(
-        rigid_link=car.get_link('base_link'), 
-        offset_T=T_cam
-    )
+    cam.attach(rigid_link=car.get_link('base_link'), offset_T=T_cam)
 
+    # Motors
     j_left = car.get_joint('rl_wheel_joint')
     j_right = car.get_joint('rr_wheel_joint')
     rear_wheels_idx = [j_left.dof_idx_local, j_right.dof_idx_local]
 
-    out = cv2.VideoWriter('last_simulation.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 60, (96, 96))
+    # FIX 1: Use .avi and MJPG (Safer for headless servers)
+    video_path = 'last_simulation.avi'
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    out = cv2.VideoWriter(video_path, fourcc, 60, (96, 96))
 
     forward_velocity = torch.tensor([[15.0, 15.0]], device='cuda')
     stop_velocity    = torch.tensor([[0.0, 0.0]], device='cuda')
+
+    print("Starting recording...")
 
     for step in range(500):
         if step < 400:
@@ -124,16 +124,26 @@ def run_phase_2_recording():
         rgb, _, _, _ = cam.render(rgb=True)
         
         if rgb is not None:
-            # 1. Extract the image for the first env
-            image = rgb[0] 
+            # FIX 2: Handle Data Types and Channels carefully
+            image = rgb[0] # Get the first environment
             
-            # 2. CRITICAL FIX: Convert Float (0.0-1.0) to Integer (0-255)
-            # Genesis gives floats, OpenCV needs uint8 integers.
+            # Debug Print (Only once)
+            if step == 0:
+                print(f"DEBUG: Raw Genesis Output Shape: {image.shape}, Dtype: {image.dtype}")
+
+            # Ensure valid range 0-255 and uint8 type
             if image.dtype != np.uint8:
                 image = (image * 255).clip(0, 255).astype(np.uint8)
 
-            # 3. Convert RGB (Genesis standard) to BGR (OpenCV standard)
-            frame_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            # FIX 3: Handle Channel Count (RGB vs RGBA)
+            # Genesis sometimes returns 4 channels (RGBA). OpenCV Writer needs 3 (BGR).
+            if image.shape[2] == 4:
+                frame_bgr = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+            else:
+                frame_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            # Ensure contiguous memory (Crucial for OpenCV writers)
+            frame_bgr = np.ascontiguousarray(frame_bgr)
             
             out.write(frame_bgr)
         
@@ -141,8 +151,8 @@ def run_phase_2_recording():
             print(f"Recording frame {step}/500")
 
     out.release()
-    print("✅ Video saved to 'last_simulation.mp4' (96x96 resolution)")
-
+    print(f"✅ Video saved to '{video_path}'")
+    
 if __name__ == "__main__":
     run_phase_1_training()
     run_phase_2_recording()
