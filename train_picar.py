@@ -214,11 +214,12 @@ def create_scene():
     # Attach to base_link (since camera_link is fused)
     # This automatically handles batched transforms for all envs.
     robot_cam.attach(
-    entity=picar,
-    link_name="base_link",
+    picar,                 # entity (URDF)
+    "base_link",            # link name (string)
     pos=(0.14, 0.0, 0.10),
     quat=get_camera_relative_quat()
 )
+
     
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
