@@ -18,10 +18,9 @@ else:
     device = "cpu"
     genesis_backend = gs.cpu
 
-# Force GPU initialization
 gs.init(backend=genesis_backend, logging_level="warning")
 
-# --- Math Helpers (Replacing missing gs.math functions) ---
+# --- Math Helpers ---
 def euler_to_quat(euler):
     roll, pitch, yaw = euler[:, 0], euler[:, 1], euler[:, 2]
     cy = torch.cos(yaw * 0.5)
@@ -42,6 +41,15 @@ def quat_apply(quat, vec):
     q_w = quat[:, 0:1]
     t = 2.0 * torch.cross(q_vec, vec, dim=-1)
     return vec + q_w * t + torch.cross(q_vec, t, dim=-1)
+
+def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return torch.stack([w, x, y, z], dim=-1)
 
 # --- URDF Generation ---
 def generate_urdf():
@@ -183,7 +191,6 @@ def create_scene():
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
-    # Fixed: Set fixed=True here; no set_fixed call later
     target = scene.add_entity(
         gs.morphs.Box(size=(0.406, 0.254, 0.305), fixed=True),
         material=gs.materials.Rigid(friction=1.0)
@@ -195,16 +202,32 @@ def create_scene():
     return scene, picar, target, viewer_cam, robot_cam
 
 def update_robot_camera(robot_cam, picar):
-    link = picar.get_link("camera_link")
-    link_pos = link.get_pos()
-    link_quat = link.get_quat()
+    # FIX: Attach to base_link and manually offset, as camera_link is fused
+    link = picar.get_link("base_link")
+    base_pos = link.get_pos()
+    base_quat = link.get_quat()
     
-    # FIXED: Send tensor to correct device
-    forward_local = torch.tensor([[1.0, 0.0, 0.0]], device=device).repeat(2048, 1)
-    forward = quat_apply(link_quat, forward_local)
+    # Offsets from URDF: xyz="0.14 0 0.10" rpy="0 -0.17 0"
+    n_envs = base_pos.shape[0]
     
-    lookat = link_pos + forward * 5.0
-    robot_cam.set_pose(pos=link_pos, lookat=lookat)
+    # 1. Position Offset
+    local_offset = torch.tensor([[0.14, 0.0, 0.10]], device=device).repeat(n_envs, 1)
+    cam_pos = base_pos + quat_apply(base_quat, local_offset)
+    
+    # 2. Rotation/Lookat Calculation
+    # Camera Pitch Rotation (Euler 0, -0.17, 0)
+    pitch_euler = torch.tensor([[0.0, -0.17, 0.0]], device=device).repeat(n_envs, 1)
+    pitch_quat = euler_to_quat(pitch_euler)
+    
+    # Combine base rotation with local pitch
+    final_cam_quat = quat_mul(base_quat, pitch_quat)
+    
+    # Calculate forward vector
+    forward_local = torch.tensor([[1.0, 0.0, 0.0]], device=device).repeat(n_envs, 1)
+    forward = quat_apply(final_cam_quat, forward_local)
+    
+    lookat = cam_pos + forward * 5.0
+    robot_cam.set_pose(pos=cam_pos, lookat=lookat)
 
 # --- Policy and Training ---
 class VisionPolicy(nn.Module):
@@ -241,7 +264,6 @@ def train():
     policy = VisionPolicy(act_dim=2).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
 
-    # FIXED: Create command buffer on correct device
     full_cmds = torch.zeros((2048, 20), device=device)
 
     max_steps = 500
@@ -250,7 +272,6 @@ def train():
     for epoch in range(40):
         scene.reset()
 
-        # FIXED: Create tensors on device
         robot_angles = torch.rand(2048, device=device) * 2 * np.pi
         euler_input = torch.stack([torch.zeros(2048, device=device), torch.zeros(2048, device=device), robot_angles], dim=1)
         robot_quat = euler_to_quat(euler_input)
@@ -268,7 +289,6 @@ def train():
 
         update_robot_camera(robot_cam, picar)
 
-        # FIXED: Done flag on device
         done = torch.zeros(2048, dtype=torch.bool, device=device)
 
         log_probs_list = []
@@ -283,7 +303,6 @@ def train():
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
             
-            # Already on device if backend is GPU, but safe cast
             obs = rgb.to(device)
 
             mean, std = policy(obs)
@@ -296,7 +315,6 @@ def train():
             log_probs_list.append(log_prob)
             entropies_list.append(entropy)
 
-            # Keep action on GPU for control
             action_control = action.clone()
             action_control[done] = 0.0
 
@@ -384,7 +402,6 @@ def train():
         if frame_rgb.ndim == 4:
             frame_rgb = frame_rgb[0]
         
-        # Move to CPU for OpenCV
         frame = (frame_rgb.cpu().numpy() * 255).astype(np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         out.write(frame)
