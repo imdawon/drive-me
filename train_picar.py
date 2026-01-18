@@ -8,56 +8,42 @@ import cv2
 import os
 
 # --- Backend Setup ---
-device = "cuda"
-genesis_backend = gs.gpu
+if torch.cuda.is_available():
+    device = "cuda"
+    genesis_backend = gs.gpu
+elif torch.backends.mps.is_available():
+    device = "mps"
+    genesis_backend = gs.cpu
+else:
+    device = "cpu"
+    genesis_backend = gs.cpu
 
+# Force GPU initialization
 gs.init(backend=genesis_backend, logging_level="warning")
 
-# --- Math Helpers (Fixing missing gs.math functions) ---
-
+# --- Math Helpers (Replacing missing gs.math functions) ---
 def euler_to_quat(euler):
-    """
-    Converts Euler angles (Roll, Pitch, Yaw) to Quaternions (W, X, Y, Z).
-    Input: euler (N, 3) tensor
-    Output: quat (N, 4) tensor [w, x, y, z]
-    """
     roll, pitch, yaw = euler[:, 0], euler[:, 1], euler[:, 2]
-
     cy = torch.cos(yaw * 0.5)
     sy = torch.sin(yaw * 0.5)
     cp = torch.cos(pitch * 0.5)
     sp = torch.sin(pitch * 0.5)
     cr = torch.cos(roll * 0.5)
     sr = torch.sin(roll * 0.5)
-
     w = cr * cp * cy + sr * sp * sy
     x = sr * cp * cy - cr * sp * sy
     y = cr * sp * cy + sr * cp * sy
     z = cr * cp * sy - sr * sp * cy
-
     return torch.stack([w, x, y, z], dim=-1)
 
 def quat_apply(quat, vec):
-    """
-    Applies quaternion rotation to vectors.
-    Input: quat (N, 4) [w, x, y, z], vec (N, 3)
-    Output: (N, 3) rotated vectors
-    """
-    # Extract components
     w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    
-    # Vector part of quaternion
-    q_vec = quat[:, 1:] 
+    q_vec = quat[:, 1:]
     q_w = quat[:, 0:1]
-
-    # Standard formula for vector rotation: v' = v + 2 * cross(q_v, cross(q_v, v) + q_w * v)
     t = 2.0 * torch.cross(q_vec, vec, dim=-1)
-    v_prime = vec + q_w * t + torch.cross(q_vec, t, dim=-1)
-    
-    return v_prime
+    return vec + q_w * t + torch.cross(q_vec, t, dim=-1)
 
 # --- URDF Generation ---
-
 def generate_urdf():
     urdf_content = """<?xml version="1.0"?>
 <robot name="picar">
@@ -187,7 +173,6 @@ def generate_urdf():
     return "picar.urdf"
 
 # --- Scene Creation ---
-
 def create_scene():
     urdf_path = generate_urdf()
     scene = gs.Scene(
@@ -198,7 +183,7 @@ def create_scene():
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
-    # FIX: Use fixed=True here, removed set_fixed()
+    # Fixed: Set fixed=True here; no set_fixed call later
     target = scene.add_entity(
         gs.morphs.Box(size=(0.406, 0.254, 0.305), fixed=True),
         material=gs.materials.Rigid(friction=1.0)
@@ -214,16 +199,14 @@ def update_robot_camera(robot_cam, picar):
     link_pos = link.get_pos()
     link_quat = link.get_quat()
     
-    forward_local = torch.tensor([[1.0, 0.0, 0.0]], device="cpu").repeat(2048, 1)
-    
-    # FIX: Use helper quat_apply
+    # FIXED: Send tensor to correct device
+    forward_local = torch.tensor([[1.0, 0.0, 0.0]], device=device).repeat(2048, 1)
     forward = quat_apply(link_quat, forward_local)
     
     lookat = link_pos + forward * 5.0
     robot_cam.set_pose(pos=link_pos, lookat=lookat)
 
 # --- Policy and Training ---
-
 class VisionPolicy(nn.Module):
     def __init__(self, act_dim=2):
         super().__init__()
@@ -258,7 +241,8 @@ def train():
     policy = VisionPolicy(act_dim=2).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
 
-    full_cmds = torch.zeros((2048, 20), device="cpu")
+    # FIXED: Create command buffer on correct device
+    full_cmds = torch.zeros((2048, 20), device=device)
 
     max_steps = 500
     contact_threshold = 0.45
@@ -266,19 +250,17 @@ def train():
     for epoch in range(40):
         scene.reset()
 
-        robot_angles = torch.rand(2048, device="cpu") * 2 * np.pi
-        
-        # FIX: Use helper euler_to_quat
-        euler_input = torch.stack([torch.zeros(2048, device="cpu"), torch.zeros(2048, device="cpu"), robot_angles], dim=1)
+        # FIXED: Create tensors on device
+        robot_angles = torch.rand(2048, device=device) * 2 * np.pi
+        euler_input = torch.stack([torch.zeros(2048, device=device), torch.zeros(2048, device=device), robot_angles], dim=1)
         robot_quat = euler_to_quat(euler_input)
-        
         picar.set_quat(robot_quat)
 
-        target_angles = torch.rand(2048, device="cpu") * 2 * np.pi
-        target_dists = 0.6 + torch.rand(2048, device="cpu") * 2.4
+        target_angles = torch.rand(2048, device=device) * 2 * np.pi
+        target_dists = 0.6 + torch.rand(2048, device=device) * 2.4
         target_x = target_dists * torch.cos(target_angles)
         target_y = target_dists * torch.sin(target_angles)
-        target_pos = torch.stack([target_x, target_y, torch.full((2048,), 0.1525, device="cpu")], dim=1)
+        target_pos = torch.stack([target_x, target_y, torch.full((2048,), 0.1525, device=device)], dim=1)
         target.set_pos(target_pos)
 
         pos = picar.get_pos()
@@ -286,7 +268,8 @@ def train():
 
         update_robot_camera(robot_cam, picar)
 
-        done = torch.zeros(2048, dtype=torch.bool, device="cpu")
+        # FIXED: Done flag on device
+        done = torch.zeros(2048, dtype=torch.bool, device=device)
 
         log_probs_list = []
         entropies_list = []
@@ -296,27 +279,30 @@ def train():
             if done.all():
                 break
 
-            rgb, _, _, _ = robot_cam.render() # Correct unpacking
+            rgb, _, _, _ = robot_cam.render()
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
-            obs_gpu = rgb.to(device)
+            
+            # Already on device if backend is GPU, but safe cast
+            obs = rgb.to(device)
 
-            mean, std = policy(obs_gpu)
+            mean, std = policy(obs)
             distri = D.Normal(mean, std)
-            action_gpu = distri.rsample()
+            action = distri.rsample()
 
-            log_prob = distri.log_prob(action_gpu).sum(dim=-1)
+            log_prob = distri.log_prob(action).sum(dim=-1)
             entropy = distri.entropy().sum(dim=-1)
 
             log_probs_list.append(log_prob)
             entropies_list.append(entropy)
 
-            action_cpu = action_gpu.cpu()
-            action_cpu[done] = 0.0
+            # Keep action on GPU for control
+            action_control = action.clone()
+            action_control[done] = 0.0
 
             full_cmds.fill_(0)
-            full_cmds[:, motor_indices[0]] = action_cpu[:, 0]
-            full_cmds[:, motor_indices[1]] = action_cpu[:, 1]
+            full_cmds[:, motor_indices[0]] = action_control[:, 0]
+            full_cmds[:, motor_indices[1]] = action_control[:, 1]
 
             picar.control_dofs_velocity(full_cmds)
             scene.step()
@@ -327,18 +313,16 @@ def train():
             new_dist = torch.norm(new_pos[:, :2] - target_pos[:, :2], dim=1)
 
             new_quat = picar.get_quat()
-            
-            # Note: This formula assumes [w, x, y, z] convention which matches our helper
             yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]),
                               1 - 2 * (new_quat[:,2]**2 + new_quat[:,3]**2))
-                              
+            
             desired_yaw = torch.atan2(target_pos[:,1] - new_pos[:,1], target_pos[:,0] - new_pos[:,0])
             diff = (desired_yaw - yaw + np.pi) % (2 * np.pi) - np.pi
             heading_bonus = torch.cos(diff)
 
             reward = (previous_dist - new_dist) * 10.0
             reward += heading_bonus
-            reward -= (action_cpu ** 2).mean(dim=1) * 0.0001
+            reward -= (action ** 2).mean(dim=1) * 0.0001
             reward -= 0.02
 
             contact = new_dist < contact_threshold
@@ -349,7 +333,7 @@ def train():
 
             previous_dist = new_dist.clone()
 
-            rewards_list.append(reward.to(device))
+            rewards_list.append(reward)
 
         log_probs = torch.stack(log_probs_list, dim=1)
         entropies = torch.stack(entropies_list, dim=1)
@@ -370,7 +354,7 @@ def train():
     torch.save(policy.state_dict(), "picar_vision_policy.pth")
 
     scene.reset()
-    target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * 2048, device="cpu"))
+    target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * 2048, device=device))
     update_robot_camera(robot_cam, picar)
 
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
@@ -379,14 +363,14 @@ def train():
         rgb, _, _, _ = robot_cam.render()
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
-        obs_gpu = rgb[0:1].to(device)
+        obs = rgb[0:1].to(device)
 
-        mean, _ = policy(obs_gpu)
-        actions_cpu = mean.cpu()
+        mean, _ = policy(obs)
+        actions = mean
 
         full_cmds.fill_(0)
-        full_cmds[:, motor_indices[0]] = actions_cpu[:, 0]
-        full_cmds[:, motor_indices[1]] = actions_cpu[:, 1]
+        full_cmds[:, motor_indices[0]] = actions[:, 0]
+        full_cmds[:, motor_indices[1]] = actions[:, 1]
 
         picar.control_dofs_velocity(full_cmds)
         scene.step()
@@ -399,6 +383,8 @@ def train():
         frame_rgb, _, _, _ = viewer_cam.render()
         if frame_rgb.ndim == 4:
             frame_rgb = frame_rgb[0]
+        
+        # Move to CPU for OpenCV
         frame = (frame_rgb.cpu().numpy() * 255).astype(np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         out.write(frame)
