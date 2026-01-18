@@ -150,15 +150,17 @@ def create_scene():
     urdf_path = generate_urdf()
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.02, substeps=4),
-        show_viewer=True,
+        show_viewer=False,
     )
     plane = scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=1.2))
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
-    target = scene.add_entity(gs.morphs.Box(size=(0.406, 0.254, 0.305)))
-    target.set_material(gs.materials.Visual(color=(0.65, 0.45, 0.30, 1.0)), gs.materials.Rigid(friction=1.0))
-    target.set_fixed(torch.full((2048,), True, dtype=bool, device="cpu"))
+    target = scene.add_entity(
+        gs.morphs.Box(size=(0.406, 0.254, 0.305)),
+        material=gs.materials.Rigid(friction=1.0)
+    )
+    target.set_fixed(torch.full((2048,), True, dtype=torch.bool, device="cpu"))
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
     robot_cam = scene.add_camera(res=(96, 96), fov=70, near=0.01, far=20.0)
     scene.build(n_envs=2048)
