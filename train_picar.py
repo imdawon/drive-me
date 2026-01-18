@@ -19,8 +19,7 @@ else:
 gs.init(backend=genesis_backend, logging_level="warning")
 
 def generate_urdf():
-    urdf_content = """
-<?xml version="1.0"?>
+    urdf_content = """<?xml version="1.0"?>
 <robot name="picar">
   <link name="base_link">
     <visual>
@@ -142,8 +141,7 @@ def generate_urdf():
     <child link="camera_link"/>
     <origin xyz="0.14 0 0.10" rpy="0 -0.17 0"/>
   </joint>
-</robot>
-"""
+</robot>"""
     with open("picar.urdf", "w") as f:
         f.write(urdf_content)
     return "picar.urdf"
@@ -174,7 +172,7 @@ def update_robot_camera(robot_cam, picar):
     link_quat = picar.get_link_quat("camera_link")
     forward_local = torch.tensor([[1.0, 0.0, 0.0]], device="cpu").repeat(2048, 1)
     forward = gs.math.quat_apply(link_quat, forward_local)
-    lookat = link_pos + forward * 3.0
+    lookat = link_pos + forward
     robot_cam.set_pose(pos=link_pos, lookat=lookat)
 
 class VisionPolicy(nn.Module):
@@ -242,6 +240,9 @@ def train():
         rewards_list = []
 
         for step in range(max_steps):
+            if done.all():
+                break
+
             rgb = robot_cam.render()
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
@@ -275,7 +276,7 @@ def train():
             new_quat = picar.get_quat()
             yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]),
                               1 - 2 * (new_quat[:,2]**2 + new_quat[:,3]**2))
-            desired_yaw = torch.atan2(new_pos[:,1] - target_pos[:,1], new_pos[:,0] - target_pos[:,0])
+            desired_yaw = torch.atan2(target_pos[:,1] - new_pos[:,1], target_pos[:,0] - new_pos[:,0])
             diff = (desired_yaw - yaw + np.pi) % (2 * np.pi) - np.pi
             heading_bonus = torch.cos(diff)
 
@@ -317,7 +318,6 @@ def train():
     update_robot_camera(robot_cam, picar)
 
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
-    done_demo = torch.zeros(2048, dtype=torch.bool, device="cpu")
 
     for i in range(max_steps):
         rgb = robot_cam.render()
@@ -327,7 +327,6 @@ def train():
 
         mean, _ = policy(obs_gpu)
         actions_cpu = mean.cpu()
-        actions_cpu[done_demo] = 0.0
 
         full_cmds.fill_(0)
         full_cmds[:, motor_indices[0]] = actions_cpu[:, 0]
@@ -347,9 +346,6 @@ def train():
         frame = (frame_rgb.cpu().numpy() * 255).astype(np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         out.write(frame)
-
-        new_dist_demo = torch.norm(picar.get_pos()[:, :2] - target.get_pos()[:, :2], dim=1)
-        done_demo = new_dist_demo < contact_threshold
 
     out.release()
     print("Demo video saved")
