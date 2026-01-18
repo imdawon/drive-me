@@ -150,7 +150,7 @@ def create_scene():
     urdf_path = generate_urdf()
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.02, substeps=4),
-        show_viewer=True,
+        show_viewer=False,
     )
     plane = scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=1.2))
     picar = scene.add_entity(
