@@ -113,9 +113,6 @@ tensorboard-data-server==0.7.2
 tensordict==0.10.0
 tetgen==0.6.7
 tifffile==2025.5.10
-torch==2.11.0.dev20260117+cu128
-torchaudio==2.11.0.dev20260117+cu128
-torchvision==0.25.0.dev20260117+cu128
 tqdm==4.67.1
 trimesh==4.11.1
 triton==3.6.0+git9844da95
