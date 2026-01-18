@@ -201,17 +201,22 @@ def create_scene():
     
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
     
-    # FIXED: Attach camera to base_link (since camera_link is fused)
-    # This automatically handles batched transforms for all 2048 envs.
-    # We pass the RELATIVE position and quaternion from the URDF camera_joint.
+    # FIXED: Initialize with dummies, then attach
     robot_cam = scene.add_camera(
         res=(96, 96), 
+        pos=(0.0, 0.0, 0.0), # Dummy, overridden by attach
+        lookat=(1.0, 0.0, 0.0), # Dummy
         fov=70, 
         near=0.01, 
-        far=20.0,
-        attach_to=picar.get_link("base_link"),
+        far=20.0
+    )
+    
+    # Attach to base_link (since camera_link is fused)
+    # This automatically handles batched transforms for all envs.
+    robot_cam.attach(
+        link=picar.get_link("base_link"),
         pos=(0.14, 0.0, 0.10),        # Relative offset
-        quat=get_camera_relative_quat() # Relative rotation
+        quat=get_camera_relative_quat() # Relative rotation [w, x, y, z]
     )
     
     scene.build(n_envs=2048)
@@ -275,7 +280,7 @@ def train():
         pos = picar.get_pos()
         previous_dist = torch.norm(pos[:, :2] - target_pos[:, :2], dim=1)
 
-        # REMOVED: update_robot_camera(robot_cam, picar) -> handled by attach_to
+        # No manual update needed for camera
 
         done = torch.zeros(2048, dtype=torch.bool, device=device)
 
@@ -313,7 +318,7 @@ def train():
             picar.control_dofs_velocity(full_cmds)
             scene.step()
 
-            # REMOVED: update_robot_camera(robot_cam, picar) -> handled by attach_to
+            # No manual update needed for camera
 
             new_pos = picar.get_pos()
             new_dist = torch.norm(new_pos[:, :2] - target_pos[:, :2], dim=1)
@@ -363,8 +368,6 @@ def train():
     scene.reset()
     target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * 2048, device=device))
     
-    # REMOVED: update_robot_camera(robot_cam, picar)
-
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
 
     for i in range(max_steps):
@@ -382,8 +385,6 @@ def train():
 
         picar.control_dofs_velocity(full_cmds)
         scene.step()
-
-        # REMOVED: update_robot_camera(robot_cam, picar)
 
         car_pos = picar.get_pos()[0].cpu().numpy()
         viewer_cam.set_pose(pos=(car_pos[0]-4, car_pos[1]-4, 3.0), lookat=(car_pos[0], car_pos[1], 0.0))
