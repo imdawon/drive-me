@@ -28,7 +28,6 @@ def run_phase_1_training():
         res=(96, 96),
         fov=60,
         GUI=False,
-        # We don't set pos/lookat here because attach() overrides them
     )
 
     # 3. Build Scene FIRST
@@ -36,15 +35,11 @@ def run_phase_1_training():
     scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
 
     # 4. Attach Camera (The FIX)
-    # We construct a 4x4 Transform Matrix for the mount position relative to the car
-    # This mounts the camera 0.1m forward, 0.15m up from the car's center
+    # Mount: 0.1m forward, 0.15m up from car center
     T_cam = np.eye(4)
-    T_cam[:3, 3] = np.array([0.1, 0.0, 0.15]) # Position offset (x, y, z)
-    # Rotation: Default identity is usually fine if car and camera coordinate systems align
+    T_cam[:3, 3] = np.array([0.1, 0.0, 0.15]) 
     
-    # We attach to the 'base_link' of the car. 
-    # Note: Ensure your URDF actually has a link named 'base_link'. 
-    # If not, use car.links[0].
+    # Ensure 'base_link' exists in your URDF, or use car.links[0]
     cam.attach(
         rigid_link=car.get_link('base_link'), 
         offset_T=T_cam
@@ -70,6 +65,7 @@ def run_phase_1_training():
         scene.step()
 
         if step % 100 == 0:
+            # Note: The rasterizer returns a NumPy array here
             rgb, _, _, _ = cam.render(rgb=True)
             print(f"Step {step}: Generated Observation Tensor {rgb.shape}")
     
@@ -124,9 +120,18 @@ def run_phase_2_recording():
         
         scene.step()
 
+        # Render
         rgb, _, _, _ = cam.render(rgb=True)
+        
         if rgb is not None:
-            image = rgb[0].cpu().numpy()
+            # FIX: 'rgb' is already a NumPy array. 
+            # We access the first environment [0] directly.
+            image = rgb[0] 
+            
+            # Optional: If image is float (0-1), convert to uint8 (0-255)
+            # Genesis Rasterizer usually returns float. Uncomment if video is black.
+            # image = (image * 255).astype(np.uint8)
+
             out.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         
         if step % 50 == 0:
