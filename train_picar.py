@@ -23,7 +23,7 @@ scene = gs.Scene(
 plane = scene.add_entity(gs.morphs.Plane())
 car = scene.add_entity(
     gs.morphs.URDF(
-        file='picarx.urdf',
+        file='picar.urdf',
         pos=(0, 0, 0.1),
         fixed=False
     )
