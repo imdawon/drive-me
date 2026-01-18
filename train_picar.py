@@ -31,7 +31,7 @@ def get_camera_transform():
     # Note: Depending on coordinate system, -90 might be "right". 
     # I used -90 here as it's standard for "Right" in right-handed systems.
     # If it faces Left, change -90 to 90.
-    theta_z = np.radians(-90) 
+    theta_z = np.radians(90) 
     rot_z = np.array([
         [np.cos(theta_z), -np.sin(theta_z), 0],
         [np.sin(theta_z),  np.cos(theta_z), 0],
