@@ -21,7 +21,8 @@ else:
 gs.init(backend=genesis_backend, logging_level="warning")
 
 # --- Math Helpers ---
-def euler_to_quat(euler):
+def euler_to_quat_tensor(euler):
+    """Batched tensor version for the training loop"""
     roll, pitch, yaw = euler[:, 0], euler[:, 1], euler[:, 2]
     cy = torch.cos(yaw * 0.5)
     sy = torch.sin(yaw * 0.5)
@@ -35,21 +36,21 @@ def euler_to_quat(euler):
     z = cr * cp * sy - sr * sp * cy
     return torch.stack([w, x, y, z], dim=-1)
 
-def quat_apply(quat, vec):
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    q_vec = quat[:, 1:]
-    q_w = quat[:, 0:1]
-    t = 2.0 * torch.cross(q_vec, vec, dim=-1)
-    return vec + q_w * t + torch.cross(q_vec, t, dim=-1)
-
-def quat_mul(q1, q2):
-    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
-    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-    return torch.stack([w, x, y, z], dim=-1)
+def get_camera_relative_quat():
+    """Calculates the single relative quaternion for the camera attachment (CPU/Numpy)"""
+    # URDF RPY: 0, -0.17, 0
+    roll, pitch, yaw = 0.0, -0.17, 0.0
+    cy = np.cos(yaw * 0.5)
+    sy = np.sin(yaw * 0.5)
+    cp = np.cos(pitch * 0.5)
+    sp = np.sin(pitch * 0.5)
+    cr = np.cos(roll * 0.5)
+    sr = np.sin(roll * 0.5)
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return (w, x, y, z)
 
 # --- URDF Generation ---
 def generate_urdf():
@@ -188,46 +189,33 @@ def create_scene():
         show_viewer=False,
     )
     plane = scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=1.2))
+    
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
+    
     target = scene.add_entity(
         gs.morphs.Box(size=(0.406, 0.254, 0.305), fixed=True),
         material=gs.materials.Rigid(friction=1.0)
     )
     
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
-    robot_cam = scene.add_camera(res=(96, 96), fov=70, near=0.01, far=20.0)
+    
+    # FIXED: Attach camera to base_link (since camera_link is fused)
+    # This automatically handles batched transforms for all 2048 envs.
+    # We pass the RELATIVE position and quaternion from the URDF camera_joint.
+    robot_cam = scene.add_camera(
+        res=(96, 96), 
+        fov=70, 
+        near=0.01, 
+        far=20.0,
+        attach_to=picar.get_link("base_link"),
+        pos=(0.14, 0.0, 0.10),        # Relative offset
+        quat=get_camera_relative_quat() # Relative rotation
+    )
+    
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
-
-def update_robot_camera(robot_cam, picar):
-    # FIX: Attach to base_link and manually offset, as camera_link is fused
-    link = picar.get_link("base_link")
-    base_pos = link.get_pos()
-    base_quat = link.get_quat()
-    
-    # Offsets from URDF: xyz="0.14 0 0.10" rpy="0 -0.17 0"
-    n_envs = base_pos.shape[0]
-    
-    # 1. Position Offset
-    local_offset = torch.tensor([[0.14, 0.0, 0.10]], device=device).repeat(n_envs, 1)
-    cam_pos = base_pos + quat_apply(base_quat, local_offset)
-    
-    # 2. Rotation/Lookat Calculation
-    # Camera Pitch Rotation (Euler 0, -0.17, 0)
-    pitch_euler = torch.tensor([[0.0, -0.17, 0.0]], device=device).repeat(n_envs, 1)
-    pitch_quat = euler_to_quat(pitch_euler)
-    
-    # Combine base rotation with local pitch
-    final_cam_quat = quat_mul(base_quat, pitch_quat)
-    
-    # Calculate forward vector
-    forward_local = torch.tensor([[1.0, 0.0, 0.0]], device=device).repeat(n_envs, 1)
-    forward = quat_apply(final_cam_quat, forward_local)
-    
-    lookat = cam_pos + forward * 5.0
-    robot_cam.set_pose(pos=cam_pos, lookat=lookat)
 
 # --- Policy and Training ---
 class VisionPolicy(nn.Module):
@@ -274,7 +262,7 @@ def train():
 
         robot_angles = torch.rand(2048, device=device) * 2 * np.pi
         euler_input = torch.stack([torch.zeros(2048, device=device), torch.zeros(2048, device=device), robot_angles], dim=1)
-        robot_quat = euler_to_quat(euler_input)
+        robot_quat = euler_to_quat_tensor(euler_input)
         picar.set_quat(robot_quat)
 
         target_angles = torch.rand(2048, device=device) * 2 * np.pi
@@ -287,7 +275,7 @@ def train():
         pos = picar.get_pos()
         previous_dist = torch.norm(pos[:, :2] - target_pos[:, :2], dim=1)
 
-        update_robot_camera(robot_cam, picar)
+        # REMOVED: update_robot_camera(robot_cam, picar) -> handled by attach_to
 
         done = torch.zeros(2048, dtype=torch.bool, device=device)
 
@@ -325,12 +313,13 @@ def train():
             picar.control_dofs_velocity(full_cmds)
             scene.step()
 
-            update_robot_camera(robot_cam, picar)
+            # REMOVED: update_robot_camera(robot_cam, picar) -> handled by attach_to
 
             new_pos = picar.get_pos()
             new_dist = torch.norm(new_pos[:, :2] - target_pos[:, :2], dim=1)
 
             new_quat = picar.get_quat()
+            # [w, x, y, z]
             yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]),
                               1 - 2 * (new_quat[:,2]**2 + new_quat[:,3]**2))
             
@@ -373,7 +362,8 @@ def train():
 
     scene.reset()
     target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * 2048, device=device))
-    update_robot_camera(robot_cam, picar)
+    
+    # REMOVED: update_robot_camera(robot_cam, picar)
 
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
 
@@ -393,7 +383,7 @@ def train():
         picar.control_dofs_velocity(full_cmds)
         scene.step()
 
-        update_robot_camera(robot_cam, picar)
+        # REMOVED: update_robot_camera(robot_cam, picar)
 
         car_pos = picar.get_pos()[0].cpu().numpy()
         viewer_cam.set_pose(pos=(car_pos[0]-4, car_pos[1]-4, 3.0), lookat=(car_pos[0], car_pos[1], 0.0))
