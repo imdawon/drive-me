@@ -53,8 +53,17 @@ def run_phase_1_training():
 
     scene = gs.Scene(
         show_viewer=False,
-        sim_options=gs.options.SimOptions(dt=0.01),
-        rigid_options=gs.options.RigidOptions(enable_collision=True),
+        # Update 1: Increase simulation frequency or substeps
+        sim_options=gs.options.SimOptions(
+            dt=0.01,       # Control frequency (100Hz)
+            substeps=4,    # Physics frequency (400Hz) - SMOOTHS CONTACTS
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=True,
+            # Update 2: (Optional) Add damping if substeps don't fix it completely
+            # contact_stiffness=5000, 
+            # contact_damping=100,
+        ),
         renderer=gs.renderers.Rasterizer(), 
     )
 
