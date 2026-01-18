@@ -61,7 +61,7 @@ def run_phase_1_training():
         rigid_options=gs.options.RigidOptions(
             enable_collision=True,
             # Update 2: (Optional) Add damping if substeps don't fix it completely
-            contact_stiffness=5000, 
+            # contact_stiffness=5000, 
             contact_damping=100,
         ),
         renderer=gs.renderers.Rasterizer(), 
