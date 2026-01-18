@@ -2,6 +2,7 @@ import genesis as gs
 import torch
 import cv2
 import time
+import numpy as np # Required for transform matrices
 
 # 1. SETUP
 gs.init(backend=gs.gpu)
@@ -16,28 +17,38 @@ def run_phase_1_training():
         show_viewer=False,
         sim_options=gs.options.SimOptions(dt=0.01),
         rigid_options=gs.options.RigidOptions(enable_collision=True),
-        renderer=gs.renderers.Rasterizer(), # Required for camera sensors
+        renderer=gs.renderers.Rasterizer(), 
     )
 
     plane = scene.add_entity(gs.morphs.Plane())
     car = scene.add_entity(gs.morphs.URDF(file='picarx.urdf', fixed=False, pos=(0, 0, 0.1)))
 
-    # 2. Attach Ego-Centric Camera
-    # res=(96, 96) limits vision to specific request
-    # attached=car locks the camera to the robot chassis
-    # pos/lookat become relative offsets: (0.1, 0, 0.1) is roughly "on the hood"
+    # 2. Add Camera (Without 'attached' argument)
     cam = scene.add_camera(
         res=(96, 96),
-        attached=car,
-        pos=(0.1, 0.0, 0.15), 
-        lookat=(1.0, 0.0, 0.0), # Looking forward relative to car
         fov=60,
-        GUI=False
+        GUI=False,
+        # We don't set pos/lookat here because attach() overrides them
     )
 
-    # Build with 1000 Environments
+    # 3. Build Scene FIRST
     n_envs = 1000
     scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
+
+    # 4. Attach Camera (The FIX)
+    # We construct a 4x4 Transform Matrix for the mount position relative to the car
+    # This mounts the camera 0.1m forward, 0.15m up from the car's center
+    T_cam = np.eye(4)
+    T_cam[:3, 3] = np.array([0.1, 0.0, 0.15]) # Position offset (x, y, z)
+    # Rotation: Default identity is usually fine if car and camera coordinate systems align
+    
+    # We attach to the 'base_link' of the car. 
+    # Note: Ensure your URDF actually has a link named 'base_link'. 
+    # If not, use car.links[0].
+    cam.attach(
+        rigid_link=car.get_link('base_link'), 
+        offset_T=T_cam
+    )
 
     # Motor Setup
     j_left = car.get_joint('rl_wheel_joint')
@@ -51,7 +62,6 @@ def run_phase_1_training():
     
     # Run Simulation Loop
     for step in range(500):
-        # Actuation
         if step < 400:
             car.control_dofs_velocity(forward_velocity, rear_wheels_idx)
         else:
@@ -59,9 +69,6 @@ def run_phase_1_training():
         
         scene.step()
 
-        # 3. Observation (The Robot "Seeing")
-        # This replaces God-Mode state access.
-        # rgb shape will be: [1000, 96, 96, 3]
         if step % 100 == 0:
             rgb, _, _, _ = cam.render(rgb=True)
             print(f"Step {step}: Generated Observation Tensor {rgb.shape}")
@@ -84,24 +91,26 @@ def run_phase_2_recording():
     plane = scene.add_entity(gs.morphs.Plane())
     car = scene.add_entity(gs.morphs.URDF(file='picarx.urdf', fixed=False, pos=(0, 0, 0.1)))
 
-    # Camera Setup (Identical to Phase 1)
-    # We record exactly what the robot sees (96x96)
     cam = scene.add_camera(
         res=(96, 96),
-        attached=car,
-        pos=(0.1, 0.0, 0.15),
-        lookat=(1.0, 0.0, 0.0), 
         fov=60,
         GUI=False
     )
 
     scene.build(n_envs=1)
 
+    # Attach Camera (Same fix as Phase 1)
+    T_cam = np.eye(4)
+    T_cam[:3, 3] = np.array([0.1, 0.0, 0.15]) 
+    cam.attach(
+        rigid_link=car.get_link('base_link'), 
+        offset_T=T_cam
+    )
+
     j_left = car.get_joint('rl_wheel_joint')
     j_right = car.get_joint('rr_wheel_joint')
     rear_wheels_idx = [j_left.dof_idx_local, j_right.dof_idx_local]
 
-    # Video Writer - Note the resolution must match the camera (96x96)
     out = cv2.VideoWriter('last_simulation.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 60, (96, 96))
 
     forward_velocity = torch.tensor([[15.0, 15.0]], device='cuda')
@@ -115,16 +124,9 @@ def run_phase_2_recording():
         
         scene.step()
 
-        # Update Camera
-        # NO MANUAL UPDATE NEEDED. 
-        # The camera is rigidly attached to the car and moves with the physics engine.
-
-        # Record
         rgb, _, _, _ = cam.render(rgb=True)
         if rgb is not None:
-            # rgb[0] extracts the single environment image
             image = rgb[0].cpu().numpy()
-            # Convert RGB (Genesis) to BGR (OpenCV)
             out.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         
         if step % 50 == 0:
