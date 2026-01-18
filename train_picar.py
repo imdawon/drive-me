@@ -7,15 +7,14 @@ import time
 # --- PHYSICS CONSTANTS (1 m/s Calibration) ---
 # Wheel Radius: 0.0325m | Target: 1.0 m/s
 TARGET_SPEED_RADS = 30.8   
-TORQUE_LIMIT_NM   = 0.15   # Matches updated URDF limit
-SIM_BOOST         = 1.5    # Helper for digital friction
+TORQUE_LIMIT_NM   = 0.15   
+SIM_BOOST         = 1.5    
 
 def get_camera_transform():
-    # 1. Start with Identity
     T = np.eye(4)
-    # 2. Position: Forward 0.1m, Up 0.15m
+    # Position: Forward 0.1m, Up 0.15m
     T[:3, 3] = np.array([0.1, 0.0, 0.15])
-    # 3. Rotation: Lift 90 deg (X), then Turn 90 deg (Z)
+    # Rotation: Lift 90 deg (X), then Turn 90 deg (Z)
     rot_x = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
     rot_z = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])
     T[:3, :3] = rot_z @ rot_x
@@ -32,7 +31,6 @@ def run_simulation(is_recording=False):
     gs.init(backend=gs.gpu)
 
     # 2. SCENE CREATION
-    # using dt=0.01 and substeps=10 for stable 1000Hz physics
     scene = gs.Scene(
         show_viewer=False,
         sim_options=gs.options.SimOptions(
@@ -42,7 +40,7 @@ def run_simulation(is_recording=False):
         rigid_options=gs.options.RigidOptions(
             enable_collision=True,
             gravity=(0, 0, -9.8),
-            default_restitution=0.5,
+            # REMOVED: default_restitution is not a valid global option
         ),
         renderer=gs.renderers.Rasterizer(), 
     )
@@ -57,7 +55,7 @@ def run_simulation(is_recording=False):
     # Setup Camera
     cam = scene.add_camera(res=(96, 96), fov=60, GUI=False)
 
-    # 3. BUILD (Dynamic Environment Count)
+    # 3. BUILD
     n_envs = 1 if is_recording else 1000
     scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
 
@@ -74,14 +72,14 @@ def run_simulation(is_recording=False):
     
     dofs = car.n_dofs
     
-    # Velocity Control Mode: KP=0, KV=5.0 (Tuned for 1m/s response)
+    # Velocity Control Mode: KP=0, KV=5.0
     kps = np.array([0.0] * dofs)    
     kvs = np.array([5.0] * dofs)    
     
     car.set_dofs_kp(kps)
     car.set_dofs_kv(kvs)
     
-    # Torque Limits (Critical for realism)
+    # Torque Limits
     limit_val = TORQUE_LIMIT_NM * SIM_BOOST
     car.set_dofs_force_range(
         lower=np.array([-limit_val] * dofs), 
@@ -89,11 +87,10 @@ def run_simulation(is_recording=False):
     )
 
     # 6. COMMAND TENSORS
-    # Create tensors sized for n_envs (works for both 1 and 1000)
     forward_velocity = torch.full((n_envs, 2), TARGET_SPEED_RADS, device='cuda')
     stop_velocity    = torch.zeros((n_envs, 2), device='cuda')
 
-    # Video Writer (Only for Recording Mode)
+    # Video Writer
     out = None
     if is_recording:
         video_path = 'last_simulation.avi'
@@ -112,11 +109,9 @@ def run_simulation(is_recording=False):
         
         scene.step()
 
-        # Render & Save (Only if recording)
         if is_recording:
             rgb, _, _, _ = cam.render(rgb=True)
             if rgb is not None:
-                # Handle Shape discrepancies (Batch vs Single)
                 if rgb.ndim == 4: image = rgb[0]
                 else: image = rgb
                 
@@ -132,8 +127,7 @@ def run_simulation(is_recording=False):
         
         # Periodic Logging
         if step % 50 == 0:
-            # Get velocity of first environment for checking
-            vel = car.get_v()[0] # [vx, vy, vz, wx, wy, wz]
+            vel = car.get_v()[0] 
             speed = np.linalg.norm(vel[:2].cpu().numpy())
             print(f"Step {step}: Env 0 Speed = {speed:.3f} m/s")
 
@@ -141,13 +135,8 @@ def run_simulation(is_recording=False):
         out.release()
         print(f"✅ Video saved to {video_path}")
     
-    # Cleanup to prevent GPU memory leaks between runs
-    # Note: Genesis currently handles cleanup on re-init, but explicit is good practice
     return
 
 if __name__ == "__main__":
-    # Phase 1: Verify High-Performance Parallel Training
     run_simulation(is_recording=False)
-    
-    # Phase 2: Verify Visuals and Physics Accuracy
     run_simulation(is_recording=True)
