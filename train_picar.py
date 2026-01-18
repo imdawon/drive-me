@@ -8,15 +8,8 @@ import cv2
 import os
 
 # --- Backend Setup ---
-if torch.cuda.is_available():
-    device = "cuda"
-    genesis_backend = gs.gpu
-elif torch.backends.mps.is_available():
-    device = "mps"
-    genesis_backend = gs.cpu
-else:
-    device = "cpu"
-    genesis_backend = gs.cpu
+device = "cuda"
+genesis_backend = gs.gpu
 
 gs.init(backend=genesis_backend, logging_level="warning")
 
