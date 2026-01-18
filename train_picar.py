@@ -124,15 +124,18 @@ def run_phase_2_recording():
         rgb, _, _, _ = cam.render(rgb=True)
         
         if rgb is not None:
-            # FIX: 'rgb' is already a NumPy array. 
-            # We access the first environment [0] directly.
+            # 1. Extract the image for the first env
             image = rgb[0] 
             
-            # Optional: If image is float (0-1), convert to uint8 (0-255)
-            # Genesis Rasterizer usually returns float. Uncomment if video is black.
-            # image = (image * 255).astype(np.uint8)
+            # 2. CRITICAL FIX: Convert Float (0.0-1.0) to Integer (0-255)
+            # Genesis gives floats, OpenCV needs uint8 integers.
+            if image.dtype != np.uint8:
+                image = (image * 255).clip(0, 255).astype(np.uint8)
 
-            out.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            # 3. Convert RGB (Genesis standard) to BGR (OpenCV standard)
+            frame_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+            out.write(frame_bgr)
         
         if step % 50 == 0:
             print(f"Recording frame {step}/500")
