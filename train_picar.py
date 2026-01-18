@@ -1,21 +1,20 @@
 import genesis as gs
 import torch
+import cv2
 import numpy as np
 import time
 
 # 1. SETUP
 gs.init(backend=gs.gpu)
 
-# 2. SCENE (HEADLESS MODE)
-# show_viewer=False prevents the "libEGL" and "dri2" crashes on servers
+# 2. SCENE
+# We enable the Rasterizer here so we CAN record video later, 
+# even though show_viewer is False.
 scene = gs.Scene(
     show_viewer=False,
-    sim_options=gs.options.SimOptions(
-        dt=0.01,
-    ),
-    rigid_options=gs.options.RigidOptions(
-        enable_collision=True,
-    ),
+    sim_options=gs.options.SimOptions(dt=0.01),
+    rigid_options=gs.options.RigidOptions(enable_collision=True),
+    renderer=gs.renderers.Rasterizer(), # <--- REQUIRED FOR VIDEO SAVING
 )
 
 # 3. ENTITIES
@@ -29,34 +28,63 @@ car = scene.add_entity(
     )
 )
 
-# 4. BUILD (1000 Parallel Environments)
-n_envs = 1000
-scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
+# 4. CAMERA
+# Position the camera to look at the first car (Env 0)
+cam = scene.add_camera(
+    res=(640, 480),
+    pos=(1.5, -1.5, 1.2),
+    lookat=(0, 0, 0.2),
+    fov=45,
+    GUI=False
+)
 
-# 5. GET MOTORS
-# We find the joints and get their LOCAL index for the solver
+# 5. BUILD (1000 Parallel Environments)
+n_envs = 1000
+scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
+
+# 6. MOTORS
 j_left = car.get_joint('rl_wheel_joint')
 j_right = car.get_joint('rr_wheel_joint')
 rear_wheels_idx = [j_left.dof_idx_local, j_right.dof_idx_local]
 
-# 6. SIMULATION LOOP
-print(f"Starting simulation of {n_envs} cars on GPU...")
+# ==========================================================
+# PHASE 1: MASSIVE PARALLEL TRAINING (No Video)
+# ==========================================================
+print(f"🚀 PHASE 1: Simulating {n_envs} cars (High Speed)...")
 
-# Create velocity tensors
-# Shape: (n_envs, 2 motors)
-# We use a tensor on the GPU to control all 1000 cars at once
-forward_velocity = torch.full((n_envs, 2), 15.0, device='cuda') # 15 rad/s
-stop_velocity    = torch.zeros((n_envs, 2), device='cuda')      # 0 rad/s
+forward_velocity = torch.full((n_envs, 2), 15.0, device='cuda')
+stop_velocity    = torch.zeros((n_envs, 2), device='cuda')
 
-total_steps = 500 # 5 seconds
+# Run for 5 seconds
+for step in range(500):
+    if step < 400:
+        car.control_dofs_velocity(forward_velocity, rear_wheels_idx)
+    else:
+        car.control_dofs_velocity(stop_velocity, rear_wheels_idx)
+    scene.step()
 
-start_time = time.time()
+print("Phase 1 Complete.")
 
-for step in range(total_steps):
+# ==========================================================
+# PHASE 2: THE "LAST SIMULATION" (Video Recording)
+# ==========================================================
+print("🎥 PHASE 2: Recording Final Video (Environment 0)...")
+
+# 1. Reset everything to start position
+scene.reset()
+
+# 2. Setup Video Writer
+out = cv2.VideoWriter(
+    'last_simulation.mp4', 
+    cv2.VideoWriter_fourcc(*'mp4v'), 
+    60, 
+    (640, 480)
+)
+
+# 3. Run ONE episode just for the camera
+for step in range(500):
     
-    # CONTROL
-    # in Genesis, calling 'control_dofs_velocity' activates the internal velocity controller.
-    # You do NOT need to set a "control mode" beforehand.
+    # We still control all cars, but we only watch Car 0
     if step < 400:
         car.control_dofs_velocity(forward_velocity, rear_wheels_idx)
     else:
@@ -64,8 +92,23 @@ for step in range(total_steps):
 
     scene.step()
     
+    # Update camera to follow Car 0
+    # We grab the position of the FIRST car in the array
+    car_pos = car.get_pos()[0].cpu().numpy() 
+    
+    cam.set_pose(
+        pos=(car_pos[0] + 1.2, car_pos[1] - 1.2, 0.8),
+        lookat=(car_pos[0], car_pos[1], 0.2)
+    )
+    
+    # Capture Frame
+    rgb, _, _, _ = cam.render(rgb=True)
+    if rgb is not None:
+        # Genesis gives RGB, OpenCV needs BGR
+        out.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        
     if step % 100 == 0:
-        print(f"Step {step}/{total_steps} completed.")
+        print(f"Recording frame {step}/500")
 
-end_time = time.time()
-print(f"Simulation finished in {end_time - start_time:.2f} seconds.")
+out.release()
+print("✅ Video saved to 'last_simulation.mp4'")
