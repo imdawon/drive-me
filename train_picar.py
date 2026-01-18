@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import os
 
+# --- Backend Setup ---
 if torch.cuda.is_available():
     device = "cuda"
     genesis_backend = gs.gpu
@@ -16,7 +17,53 @@ elif torch.backends.mps.is_available():
 else:
     device = "cpu"
     genesis_backend = gs.cpu
+
 gs.init(backend=genesis_backend, logging_level="warning")
+
+# --- Math Helpers (Fixing missing gs.math functions) ---
+
+def euler_to_quat(euler):
+    """
+    Converts Euler angles (Roll, Pitch, Yaw) to Quaternions (W, X, Y, Z).
+    Input: euler (N, 3) tensor
+    Output: quat (N, 4) tensor [w, x, y, z]
+    """
+    roll, pitch, yaw = euler[:, 0], euler[:, 1], euler[:, 2]
+
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+    cp = torch.cos(pitch * 0.5)
+    sp = torch.sin(pitch * 0.5)
+    cr = torch.cos(roll * 0.5)
+    sr = torch.sin(roll * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+
+    return torch.stack([w, x, y, z], dim=-1)
+
+def quat_apply(quat, vec):
+    """
+    Applies quaternion rotation to vectors.
+    Input: quat (N, 4) [w, x, y, z], vec (N, 3)
+    Output: (N, 3) rotated vectors
+    """
+    # Extract components
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    
+    # Vector part of quaternion
+    q_vec = quat[:, 1:] 
+    q_w = quat[:, 0:1]
+
+    # Standard formula for vector rotation: v' = v + 2 * cross(q_v, cross(q_v, v) + q_w * v)
+    t = 2.0 * torch.cross(q_vec, vec, dim=-1)
+    v_prime = vec + q_w * t + torch.cross(q_vec, t, dim=-1)
+    
+    return v_prime
+
+# --- URDF Generation ---
 
 def generate_urdf():
     urdf_content = """<?xml version="1.0"?>
@@ -146,6 +193,8 @@ def generate_urdf():
         f.write(urdf_content)
     return "picar.urdf"
 
+# --- Scene Creation ---
+
 def create_scene():
     urdf_path = generate_urdf()
     scene = gs.Scene(
@@ -156,32 +205,31 @@ def create_scene():
     picar = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.035), fixed=False),
     )
-    
-    # FIXED: Set fixed=True in the morph. Removed target.set_fixed() which does not exist.
+    # FIX: Use fixed=True here, removed set_fixed()
     target = scene.add_entity(
         gs.morphs.Box(size=(0.406, 0.254, 0.305), fixed=True),
         material=gs.materials.Rigid(friction=1.0)
     )
     
-    # Note: target.set_fixed(...) was removed here.
-
-    target.set_fixed(torch.full((2048,), True, dtype=torch.bool, device="cpu")) if hasattr(target, 'set_fixed') else None
-
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
     robot_cam = scene.add_camera(res=(96, 96), fov=70, near=0.01, far=20.0)
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
 
 def update_robot_camera(robot_cam, picar):
-    # FIXED: Use get_link("name").get_pos() instead of get_link_pos("name")
     link = picar.get_link("camera_link")
     link_pos = link.get_pos()
     link_quat = link.get_quat()
     
     forward_local = torch.tensor([[1.0, 0.0, 0.0]], device="cpu").repeat(2048, 1)
-    forward = gs.math.quat_apply(link_quat, forward_local)
+    
+    # FIX: Use helper quat_apply
+    forward = quat_apply(link_quat, forward_local)
+    
     lookat = link_pos + forward * 5.0
     robot_cam.set_pose(pos=link_pos, lookat=lookat)
+
+# --- Policy and Training ---
 
 class VisionPolicy(nn.Module):
     def __init__(self, act_dim=2):
@@ -226,7 +274,11 @@ def train():
         scene.reset()
 
         robot_angles = torch.rand(2048, device="cpu") * 2 * np.pi
-        robot_quat = gs.math.euler_to_quat(torch.stack([torch.zeros(2048, device="cpu"), torch.zeros(2048, device="cpu"), robot_angles], dim=1))
+        
+        # FIX: Use helper euler_to_quat
+        euler_input = torch.stack([torch.zeros(2048, device="cpu"), torch.zeros(2048, device="cpu"), robot_angles], dim=1)
+        robot_quat = euler_to_quat(euler_input)
+        
         picar.set_quat(robot_quat)
 
         target_angles = torch.rand(2048, device="cpu") * 2 * np.pi
@@ -251,8 +303,7 @@ def train():
             if done.all():
                 break
 
-            # FIXED: Unpack render() tuple
-            rgb, _, _, _ = robot_cam.render()
+            rgb, _, _, _ = robot_cam.render() # Correct unpacking
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
             obs_gpu = rgb.to(device)
@@ -283,8 +334,11 @@ def train():
             new_dist = torch.norm(new_pos[:, :2] - target_pos[:, :2], dim=1)
 
             new_quat = picar.get_quat()
+            
+            # Note: This formula assumes [w, x, y, z] convention which matches our helper
             yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]),
                               1 - 2 * (new_quat[:,2]**2 + new_quat[:,3]**2))
+                              
             desired_yaw = torch.atan2(target_pos[:,1] - new_pos[:,1], target_pos[:,0] - new_pos[:,0])
             diff = (desired_yaw - yaw + np.pi) % (2 * np.pi) - np.pi
             heading_bonus = torch.cos(diff)
@@ -329,7 +383,6 @@ def train():
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
 
     for i in range(max_steps):
-        # FIXED: Unpack render() tuple
         rgb, _, _, _ = robot_cam.render()
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
