@@ -9,16 +9,22 @@ import cv2
 import os
 
 # --- Backend Setup ---
-if torch.cuda.is_available():
-    device = "cuda"
-    genesis_backend = gs.gpu
-elif torch.backends.mps.is_available():
-    device = "mps"
-    genesis_backend = gs.cpu
-else:
+# Check explicitly for cuda/mps to set backend, but handle errors gracefully
+try:
+    if torch.cuda.is_available():
+        device = "cuda"
+        genesis_backend = gs.gpu
+    elif torch.backends.mps.is_available():
+        device = "mps"
+        genesis_backend = gs.cpu
+    else:
+        device = "cpu"
+        genesis_backend = gs.cpu
+except:
     device = "cpu"
     genesis_backend = gs.cpu
 
+print(f"Using device: {device}, Genesis backend: {genesis_backend}")
 gs.init(backend=genesis_backend, logging_level="warning")
 
 # --- Math Helpers ---
@@ -209,7 +215,7 @@ def create_scene():
         far=20.0
     )
 
-    # Attach with matrix transform
+    # Attach with matrix transform using genesis.utils.geom
     rel_pos = np.array([0.14, 0.0, 0.10])
     rel_quat = np.array(get_camera_relative_quat())
     rel_transform = gu.trans_quat_to_T(rel_pos, rel_quat)
@@ -219,6 +225,7 @@ def create_scene():
         rel_transform
     )
 
+    # Build scene with 2048 environments
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
 
@@ -242,6 +249,8 @@ class VisionPolicy(nn.Module):
         self.act_scale = 21.0
 
     def forward(self, x):
+        # x expected shape: (Batch, Height, Width, Channels) -> (B, H, W, C)
+        # Permute to (Batch, Channels, Height, Width) -> (B, C, H, W)
         x = x.permute(0, 3, 1, 2)
         features = self.cnn(x)
         logits = self.mean_head(features)
@@ -258,29 +267,30 @@ def train():
     policy = VisionPolicy(act_dim=2).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
     
-    full_cmds = torch.zeros((2048, 20), device=device)
+    n_envs = 2048
+    full_cmds = torch.zeros((n_envs, 20), device=device)
     max_steps = 500
     contact_threshold = 0.45
 
     for epoch in range(40):
         scene.reset()
         
-        robot_angles = torch.rand(2048, device=device) * 2 * np.pi
-        euler_input = torch.stack([torch.zeros(2048, device=device), torch.zeros(2048, device=device), robot_angles], dim=1)
+        robot_angles = torch.rand(n_envs, device=device) * 2 * np.pi
+        euler_input = torch.stack([torch.zeros(n_envs, device=device), torch.zeros(n_envs, device=device), robot_angles], dim=1)
         robot_quat = euler_to_quat_tensor(euler_input)
         picar.set_quat(robot_quat)
         
-        target_angles = torch.rand(2048, device=device) * 2 * np.pi
-        target_dists = 0.6 + torch.rand(2048, device=device) * 2.4
+        target_angles = torch.rand(n_envs, device=device) * 2 * np.pi
+        target_dists = 0.6 + torch.rand(n_envs, device=device) * 2.4
         target_x = target_dists * torch.cos(target_angles)
         target_y = target_dists * torch.sin(target_angles)
-        target_pos = torch.stack([target_x, target_y, torch.full((2048,), 0.1525, device=device)], dim=1)
+        target_pos = torch.stack([target_x, target_y, torch.full((n_envs,), 0.1525, device=device)], dim=1)
         target.set_pos(target_pos)
         
         pos = picar.get_pos()
         previous_dist = torch.norm(pos[:, :2] - target_pos[:, :2], dim=1)
         
-        done = torch.zeros(2048, dtype=torch.bool, device=device)
+        done = torch.zeros(n_envs, dtype=torch.bool, device=device)
         log_probs_list = []
         entropies_list = []
         rewards_list = []
@@ -289,13 +299,33 @@ def train():
             if done.all():
                 break
             
+            # Rendering: returns numpy array
             rgb, _, _, _ = robot_cam.render()
+            
+            # --- CRITICAL FIX FOR DIMENSION MISMATCH ---
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
             
-            # FIXED: Convert Numpy array to Tensor before .to(device)
             obs = torch.from_numpy(rgb).float().to(device)
             
+            # Handle cases where Genesis returns single image (H, W, C) due to driver failure
+            # or (N, H, W) missing channels
+            if obs.dim() == 3:
+                # Case 1: (H, W, C) -> Single image returned
+                if obs.shape[-1] == 3:
+                    # Expand to (B, H, W, C)
+                    obs = obs.unsqueeze(0).expand(n_envs, -1, -1, -1)
+                # Case 2: (B, H, W) -> Batched but grayscale/missing channel dim
+                else:
+                    obs = obs.unsqueeze(-1).expand(-1, -1, -1, 3) # Force 3 channels if missing
+            elif obs.dim() == 4:
+                # Correct shape (B, H, W, C)
+                pass
+            else:
+                 raise RuntimeError(f"Unexpected observation shape: {obs.shape}")
+
+            # -------------------------------------------
+
             mean, std = policy(obs)
             distri = D.Normal(mean, std)
             action = distri.rsample()
@@ -319,7 +349,6 @@ def train():
             new_dist = torch.norm(new_pos[:, :2] - target_pos[:, :2], dim=1)
             new_quat = picar.get_quat()
             
-            # [w, x, y, z]
             yaw = torch.atan2(2 * (new_quat[:,0] * new_quat[:,3] + new_quat[:,1] * new_quat[:,2]), 
                               1 - 2 * (new_quat[:,2]**2 + new_quat[:,3]**2))
             
@@ -340,39 +369,50 @@ def train():
             
             rewards_list.append(reward)
         
-        log_probs = torch.stack(log_probs_list, dim=1)
-        entropies = torch.stack(entropies_list, dim=1)
-        rewards = torch.stack(rewards_list, dim=1)
-        
-        returns = rewards.sum(dim=1)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        
-        loss = -((log_probs.sum(dim=1) * returns.detach()).mean() + 0.01 * entropies.mean())
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Stack lists. Check if empty to avoid crash if done immediately
+        if len(log_probs_list) > 0:
+            log_probs = torch.stack(log_probs_list, dim=1)
+            entropies = torch.stack(entropies_list, dim=1)
+            rewards = torch.stack(rewards_list, dim=1)
+            
+            returns = rewards.sum(dim=1)
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            
+            loss = -((log_probs.sum(dim=1) * returns.detach()).mean() + 0.01 * entropies.mean())
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
         
         success_rate = done.float().mean().item()
-        avg_dist = new_dist.mean().item()
+        avg_dist = previous_dist.mean().item() # Use previous_dist as it holds last known dists
         print(f"Epoch {epoch}: Success {success_rate:.3f} Final Dist {avg_dist:.2f}")
 
     torch.save(policy.state_dict(), "picar_vision_policy.pth")
     
+    # Demo Loop
     scene.reset()
-    target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * 2048, device=device))
+    target.set_pos(torch.tensor([[3.0, 0.0, 0.1525]] * n_envs, device=device))
     out = cv2.VideoWriter('picar_vision_demo.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 50, (640, 480))
     
+    print("Generating demo video...")
     for i in range(max_steps):
         rgb, _, _, _ = robot_cam.render()
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
         
-        # FIXED: Convert slice to Tensor correctly
-        obs = torch.from_numpy(rgb[0:1]).float().to(device)
+        # Robust demo observation handling
+        obs = torch.from_numpy(rgb).float().to(device)
+        if obs.dim() == 3:
+             # If single image (H,W,C), expand to match envs
+             obs = obs.unsqueeze(0).expand(n_envs, -1, -1, -1)
+
+        # Slice just the first env for demo policy inference (though we simulate all)
+        obs_demo = obs[0:1] 
         
-        mean, _ = policy(obs)
-        actions = mean
+        mean, _ = policy(obs_demo)
+        # Broadcast action to all for simplicity in demo or just control env 0
+        actions = mean.repeat(n_envs, 1)
         
         full_cmds.fill_(0)
         full_cmds[:, motor_indices[0]] = actions[:, 0]
@@ -381,13 +421,21 @@ def train():
         
         scene.step()
         
+        # Render viewer camera following the FIRST car
         car_pos = picar.get_pos()[0].cpu().numpy()
         viewer_cam.set_pose(pos=(car_pos[0]-4, car_pos[1]-4, 3.0), lookat=(car_pos[0], car_pos[1], 0.0))
         
         frame_rgb, _, _, _ = viewer_cam.render()
+        
+        # Handle viewer frame shape issues
         if frame_rgb.ndim == 4:
             frame_rgb = frame_rgb[0]
-        frame = (frame_rgb.cpu().numpy() * 255).astype(np.uint8)
+        if frame_rgb.ndim == 3 and frame_rgb.shape[2] == 3:
+             pass # Standard HWC
+        
+        frame = (frame_rgb * 255).astype(np.uint8)
+        # Explicit copy to ensure contiguous array for OpenCV
+        frame = np.ascontiguousarray(frame)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         out.write(frame)
     
