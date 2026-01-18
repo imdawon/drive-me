@@ -199,28 +199,25 @@ def create_scene():
     )
     viewer_cam = scene.add_camera(res=(640, 480), pos=(8.0, -8.0, 5.0), lookat=(0.0, 0.0, 0.0), fov=60)
     
-    # Initialize with dummies, then attach
+    # Initialize with dummies
     robot_cam = scene.add_camera(
         res=(96, 96),
-        pos=(0.0, 0.0, 0.0), # Dummy, overridden by attach
-        lookat=(1.0, 0.0, 0.0), # Dummy
+        pos=(0.0, 0.0, 0.0), 
+        lookat=(1.0, 0.0, 0.0), 
         fov=70,
         near=0.01,
         far=20.0
     )
 
-    # --- FIX START ---
-    # Convert position and quaternion to a 4x4 transform matrix
+    # Attach with matrix transform
     rel_pos = np.array([0.14, 0.0, 0.10])
     rel_quat = np.array(get_camera_relative_quat())
     rel_transform = gu.trans_quat_to_T(rel_pos, rel_quat)
 
-    # Attach using (link, transform_matrix)
     robot_cam.attach(
         picar.get_link("base_link"),
         rel_transform
     )
-    # --- FIX END ---
 
     scene.build(n_envs=2048)
     return scene, picar, target, viewer_cam, robot_cam
@@ -295,7 +292,9 @@ def train():
             rgb, _, _, _ = robot_cam.render()
             if rgb.max() > 1.0:
                 rgb = rgb / 255.0
-            obs = rgb.to(device)
+            
+            # FIXED: Convert Numpy array to Tensor before .to(device)
+            obs = torch.from_numpy(rgb).float().to(device)
             
             mean, std = policy(obs)
             distri = D.Normal(mean, std)
@@ -368,7 +367,10 @@ def train():
         rgb, _, _, _ = robot_cam.render()
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
-        obs = rgb[0:1].to(device)
+        
+        # FIXED: Convert slice to Tensor correctly
+        obs = torch.from_numpy(rgb[0:1]).float().to(device)
+        
         mean, _ = policy(obs)
         actions = mean
         
