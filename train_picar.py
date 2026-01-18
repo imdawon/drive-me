@@ -2,178 +2,164 @@ import genesis as gs
 import torch
 import cv2
 import time
-import numpy as np 
+import numpy as np
 
 # 1. SETUP
 gs.init(backend=gs.gpu)
 
 def get_camera_transform():
-    """
-    Creates a transform matrix that offsets the camera and 
-    rotates it 90 degrees up (Y-axis) and 90 degrees right (Z-axis).
-    """
-    T_cam = np.eye(4)
+    # 1. Start with Identity
+    T = np.eye(4)
     
-    # 1. Position: 0.1m forward, 0.15m up
-    T_cam[:3, 3] = np.array([0.1, 0.0, 0.15])
+    # 2. Position (Forward 0.1, Up 0.15)
+    T[:3, 3] = np.array([0.1, 0.0, 0.15])
     
-    # 2. Rotation Matrices
-    # Rotate 90 degrees Up (Pitch around Y-axis)
-    # This turns a camera looking down (-Z) to look forward (+X)
-    theta_y = np.radians(90)
-    rot_y = np.array([
-        [np.cos(theta_y),  0, np.sin(theta_y)],
-        [0,                1, 0              ],
-        [-np.sin(theta_y), 0, np.cos(theta_y)]
+    # 3. Rotation (The Fix)
+    # Camera default: Looks down -Z axis, Top is +Y axis
+    
+    # Step A: Rotate around X by +90 degrees 
+    # (Lifts camera from looking DOWN to looking HORIZON)
+    rot_x = np.array([
+        [1, 0, 0],
+        [0, 0, -1],
+        [0, 1, 0]
     ])
-
-    # Rotate 90 degrees Right (Yaw around Z-axis)
-    # Note: Depending on coordinate system, -90 might be "right". 
-    # I used -90 here as it's standard for "Right" in right-handed systems.
-    # If it faces Left, change -90 to 90.
-    theta_z = np.radians(0) 
+    
+    # Step B: Rotate around Z by -90 degrees 
+    # (Turns camera to the RIGHT)
+    # Note: If it faces Left, change to +90 (standard rotation matrices can vary by handedness)
     rot_z = np.array([
-        [np.cos(theta_z), -np.sin(theta_z), 0],
-        [np.sin(theta_z),  np.cos(theta_z), 0],
-        [0,                0,               1]
+        [0, 1, 0],
+        [-1, 0, 0],
+        [0, 0, 1]
     ])
-
-    # Combine Rotations: Apply Y first (lift head), then Z (turn head)
-    # Matrix multiplication order: R_combined = R_z @ R_y
-    rot_combined = rot_z @ rot_y
     
-    # Apply to T_cam
-    T_cam[:3, :3] = rot_combined
-    return T_cam
+    # Combine: Apply X then Z
+    rot_combined = rot_z @ rot_x
+    
+    T[:3, :3] = rot_combined
+    return T
 
-def run_phase_1_training():
+def run_simulation(is_recording=False):
     print("\n" + "="*50)
-    print("🚀 PHASE 1: Massive Parallel Simulation (1000 Cars)")
+    mode_name = "RECORDING" if is_recording else "TRAINING"
+    print(f"🚀 PHASE: {mode_name}")
     print("="*50)
 
+    # --- FIX 1: PHYSICS STABILITY ---
+    # dt=0.01 with substeps=10 means physics runs at 1000Hz (1ms steps)
+    # This solves the "wobble/jitter" on the ground.
     scene = gs.Scene(
         show_viewer=False,
-        # Update 1: Increase simulation frequency or substeps
         sim_options=gs.options.SimOptions(
-            dt=0.01,       # Control frequency (100Hz)
-            substeps=4,    # Physics frequency (400Hz) - SMOOTHS CONTACTS
+            dt=0.01, 
+            substeps=10  
         ),
         rigid_options=gs.options.RigidOptions(
             enable_collision=True,
+            gravity=(0, 0, -9.8),
         ),
         renderer=gs.renderers.Rasterizer(), 
     )
 
     plane = scene.add_entity(gs.morphs.Plane())
-    car = scene.add_entity(gs.morphs.URDF(file='picarx.urdf', fixed=False, pos=(0, 0, 0.1)))
+    
+    # Load car
+    car = scene.add_entity(
+        gs.morphs.URDF(
+            file='picarx.urdf', 
+            fixed=False, 
+            pos=(0, 0, 0.1)
+        )
+    )
 
+    # Setup Camera
     cam = scene.add_camera(res=(96, 96), fov=60, GUI=False)
 
-    n_envs = 1000
-    scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
+    # Build Scene (Required before attaching)
+    n_envs = 1 if is_recording else 1000
+    scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
 
-    # --- FIX APPLIED HERE ---
-    T_cam = get_camera_transform()
-    
+    # --- FIX 2: CAMERA ATTACHMENT ---
+    # We attach using the corrected transform matrix
     cam.attach(
         rigid_link=car.get_link('base_link'), 
-        offset_T=T_cam
+        offset_T=get_camera_transform()
     )
 
+    # --- FIX 3: MOTOR CONTROL MODES ---
+    # We must set stiffness (kp) to 0 for velocity control to work.
+    # Otherwise, the internal P-controller tries to hold the wheel at position 0.
     j_left = car.get_joint('rl_wheel_joint')
     j_right = car.get_joint('rr_wheel_joint')
     rear_wheels_idx = [j_left.dof_idx_local, j_right.dof_idx_local]
+    
+    # Set KP (stiffness) to 0, KV (damping) to something small (e.g., 0.5 or 1.0)
+    # Note: Genesis requires setting this for all DOFs or specific ones.
+    # We iterate over the wheel indices to set their gains.
+    dofs = car.n_dofs
+    # Create gain arrays
+    kps = np.array([0.0] * dofs)     # Zero stiffness (allows free spinning)
+    kvs = np.array([10.0] * dofs)    # Some damping for stability
+    
+    # Apply gains to the car
+    car.set_dofs_kp(kps)
+    car.set_dofs_kv(kvs)
 
-    forward_velocity = torch.full((n_envs, 2), 15.0, device='cuda')
+    # Prepare Tensors
+    forward_velocity = torch.full((n_envs, 2), 25.0, device='cuda') # Increased speed slightly
     stop_velocity    = torch.zeros((n_envs, 2), device='cuda')
 
-    print("Starting Training Loop with Vision...")
+    # Video Writer Setup (Only if recording)
+    out = None
+    if is_recording:
+        video_path = 'last_simulation.avi'
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        out = cv2.VideoWriter(video_path, fourcc, 30, (96, 96))
+        print("🎥 Video Writer Initialized")
+
+    print("Starting Loop...")
     
-    for step in range(500):
-        if step < 400:
+    for step in range(200):
+        # Drive for 150 steps, then stop
+        if step < 150:
             car.control_dofs_velocity(forward_velocity, rear_wheels_idx)
         else:
             car.control_dofs_velocity(stop_velocity, rear_wheels_idx)
         
         scene.step()
 
-        if step % 100 == 0:
+        if is_recording:
             rgb, _, _, _ = cam.render(rgb=True)
-            print(f"Step {step}: Generated Observation Tensor {rgb.shape}")
-    
-    print("Phase 1 Complete.")
-    return
-
-def run_phase_2_recording():
-    print("\n" + "="*50)
-    print("🎥 PHASE 2: Recording Final Video (Ego-View)")
-    print("="*50)
-
-    scene = gs.Scene(
-        show_viewer=False,
-        sim_options=gs.options.SimOptions(dt=0.01),
-        rigid_options=gs.options.RigidOptions(enable_collision=True),
-        renderer=gs.renderers.Rasterizer(), 
-    )
-
-    plane = scene.add_entity(gs.morphs.Plane())
-    car = scene.add_entity(gs.morphs.URDF(file='picarx.urdf', fixed=False, pos=(0, 0, 0.1)))
-
-    cam = scene.add_camera(res=(96, 96), fov=60, GUI=False)
-
-    scene.build(n_envs=1)
-
-    # --- FIX APPLIED HERE ---
-    T_cam = get_camera_transform()
-    
-    cam.attach(rigid_link=car.get_link('base_link'), offset_T=T_cam)
-
-    j_left = car.get_joint('rl_wheel_joint')
-    j_right = car.get_joint('rr_wheel_joint')
-    rear_wheels_idx = [j_left.dof_idx_local, j_right.dof_idx_local]
-
-    video_path = 'last_simulation.avi'
-    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-    out = cv2.VideoWriter(video_path, fourcc, 60, (96, 96))
-
-    forward_velocity = torch.tensor([[15.0, 15.0]], device='cuda')
-    stop_velocity    = torch.tensor([[0.0, 0.0]], device='cuda')
-
-    print("Starting recording...")
-
-    for step in range(500):
-        if step < 400:
-            car.control_dofs_velocity(forward_velocity, rear_wheels_idx)
-        else:
-            car.control_dofs_velocity(stop_velocity, rear_wheels_idx)
-        
-        scene.step()
-
-        rgb, _, _, _ = cam.render(rgb=True)
-        
-        if rgb is not None:
-            if rgb.ndim == 4:
-                image = rgb[0]
-            else:
-                image = rgb
-
-            if image.dtype != np.uint8:
-                image = (image * 255).clip(0, 255).astype(np.uint8)
-
-            if image.shape[2] == 4:
-                frame_bgr = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-            else:
-                frame_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-            frame_bgr = np.ascontiguousarray(frame_bgr)
-            out.write(frame_bgr)
+            if rgb is not None:
+                # Handle Shape: (H, W, C) or (1, H, W, C)
+                if rgb.ndim == 4: image = rgb[0]
+                else: image = rgb
+                
+                # Normalize and Color Convert
+                if image.dtype != np.uint8:
+                    image = (image * 255).clip(0, 255).astype(np.uint8)
+                
+                # Check channel count (RGB vs RGBA)
+                if image.shape[2] == 4:
+                    frame = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+                else:
+                    frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                
+                out.write(frame)
         
         if step % 50 == 0:
-            print(f"Recording frame {step}/500")
+             print(f"Step {step}: Running...")
 
-    out.release()
-    print(f"✅ Video saved to '{video_path}'")
-    
+    if out:
+        out.release()
+        print(f"✅ Video saved to {video_path}")
+
+    print("Done.")
+
 if __name__ == "__main__":
-    run_phase_1_training()
-    run_phase_2_recording()
+    # Run Phase 1 (Training Check)
+    run_simulation(is_recording=False)
+    
+    # Run Phase 2 (Video Recording)
+    run_simulation(is_recording=True)
