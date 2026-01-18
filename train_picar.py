@@ -1,82 +1,77 @@
 import genesis as gs
-import numpy as np
-import imageio
+import torch
+import time
 
 # 1. SETUP
 gs.init(backend=gs.gpu)
 
-# 2. SCENE
+# 2. SCENE (HEADLESS MODE ENABLED)
+# show_viewer=False prevents the EGL/Rendering crash on servers
 scene = gs.Scene(
+    show_viewer=False, 
     sim_options=gs.options.SimOptions(
         dt=0.01,
     ),
-    viewer_options=gs.options.ViewerOptions(
-        res=(1280, 720), # HD Resolution for the video
-        camera_pos=(1.0, -1.0, 1.0),
-        camera_lookat=(0.0, 0.0, 0.0),
-        camera_fov=45,
+    rigid_options=gs.options.RigidOptions(
+        enable_collision=True,
     ),
-    show_viewer=False 
 )
 
 # 3. ENTITIES
 plane = scene.add_entity(gs.morphs.Plane())
+
 car = scene.add_entity(
     gs.morphs.URDF(
-        file='picar.urdf',
+        file='picarx.urdf',
+        fixed=False,
         pos=(0, 0, 0.1),
-        fixed=False
     )
 )
 
-# 4. CAMERA FOR RECORDING
-# We add a specific camera for rendering the video output
-cam = scene.add_camera(
-    res=(1280, 720),
-    pos=(1.5, -1.5, 1.5),
-    lookat=(0, 0, 0),
-    fov=45,
-    GUI=False
-)
+# 4. BUILD (1000 Parallel Environments)
+n_envs = 1000
+scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
 
-scene.build()
+# 5. GET MOTORS (THE FIX)
+# We use .get_joint() and .dof_idx_local to avoid the AttributeError
+try:
+    j_left = car.get_joint('rl_wheel_joint')
+    j_right = car.get_joint('rr_wheel_joint')
+    
+    # Store the indices for the solver
+    rear_wheels_idx = [j_left.dof_idx_local, j_right.dof_idx_local]
+    
+except AttributeError as e:
+    print(f"CRITICAL ERROR: Could not find joints. Check URDF joint names. {e}")
+    exit(1)
 
-# 5. CONTROL SETUP
-joints = car.dofs_info_from_names(['rl_wheel_joint', 'rr_wheel_joint'])
-rear_wheels_idx = [joints['rl_wheel_joint'], joints['rr_wheel_joint']]
+# Set control mode to VELOCITY for the rear wheels
 car.set_dofs_control_mode(rear_wheels_idx, gs.MOTION_MODE.VELOCITY)
 
-# 6. SIMULATION & RECORDING
-frames = []
-total_steps = 500  # 5 Seconds
+# 6. SIMULATION LOOP
+print(f"Starting simulation of {n_envs} cars on RTX 3090...")
 
-print("Simulating and recording...")
+# Create tensors for forward and stop
+# Shape: (n_envs, 2 motors)
+forward_velocity = torch.full((n_envs, 2), 15.0, device='cuda') # 15 rad/s
+stop_velocity    = torch.zeros((n_envs, 2), device='cuda')      # 0 rad/s
+
+total_steps = 500 # 5 seconds
+
+start_time = time.time()
 
 for step in range(total_steps):
-    # --- CONTROL ---
-    # Simple logic: Drive forward for 4s, stop for 1s
-    if step < 400:
-        car.set_dofs_velocity([15.0, 15.0], rear_wheels_idx)
-    else:
-        car.set_dofs_velocity([0.0, 0.0], rear_wheels_idx)
     
-    # --- STEP PHYSICS ---
+    # Drive for 4 seconds (400 steps), then Stop
+    if step < 400:
+        car.set_dofs_velocity(forward_velocity, rear_wheels_idx)
+    else:
+        car.set_dofs_velocity(stop_velocity, rear_wheels_idx)
+
     scene.step()
     
-    # --- UPDATE CAMERA (OPTIONAL: FOLLOW CAR) ---
-    # Update camera lookat to follow the car's position
-    car_pos = car.get_pos()
-    cam.set_pose(
-        pos=(car_pos[0] + 1.2, car_pos[1] - 1.2, 1.0), # Keep camera offset relative to car
-        lookat=car_pos
-    )
-    
-    # --- RENDER FRAME ---
-    # Capture the frame from the camera
-    rgb = cam.render()
-    frames.append(rgb)
+    if step % 100 == 0:
+        print(f"Step {step}/{total_steps} completed.")
 
-# 7. SAVE VIDEO
-print("Saving video to picar_simulation.mp4...")
-imageio.mimsave('picar_simulation.mp4', np.stack(frames), fps=60)
-print("Done!")
+end_time = time.time()
+print(f"Simulation finished in {end_time - start_time:.2f} seconds.")
