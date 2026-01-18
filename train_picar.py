@@ -69,7 +69,7 @@ class VisionPolicy(nn.Module):
             nn.Conv2d(64, 64, 3, 1), nn.ReLU(),
             nn.Flatten()
         )
-        # FIXED: 96x96 input -> 64 * 8 * 8 = 4096 features
+        # 96x96 input -> 64 * 8 * 8 = 4096 features
         self.mean = nn.Linear(4096, 2)
         self.log_std = nn.Parameter(torch.full((2,), -0.5))
 
@@ -96,7 +96,10 @@ def train():
         
         for _ in range(500):
             if done.all(): break
-            rgb = torch.from_numpy(cam.render()[0]).float().to(device) / 255.0
+            
+            # --- FIX: ADDED .copy() TO HANDLE NEGATIVE STRIDES ---
+            rgb_numpy = cam.render()[0].copy()
+            rgb = torch.from_numpy(rgb_numpy).float().to(device) / 255.0
             
             # Simple shape fix if single frame
             if rgb.ndim == 3: rgb = rgb.unsqueeze(0).expand(2048, -1, -1, -1)
